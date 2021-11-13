@@ -32,6 +32,11 @@
   :type 'string
   :group 'tsa)
 
+(defcustom tsa-tag-name "timestamped"
+  "Tag added to headings whose contents are timestamped."
+  :type 'string
+  :group 'tsa)
+
 (defun tsa--request-body (text)
   "Generate an RFC3161-compliant request body for timestamping specified text."
   (with-temp-buffer
@@ -114,39 +119,45 @@ PROPERTY is string prefix to use to extract output from 'openssl ts -reply'."
     (search-forward property)
     (buffer-substring (point) (line-end-position))))
 
-(defun tsa--section-no-drawer ()
-  "Get the section node under a heading with any RFC3136 token drawer removed."
-  (->> (org-ml-parse-this-section)
-       (org-ml-map-children
-         (-partial #'-remove
-                   (lambda (e)
-                     (and (org-ml-is-type 'drawer e)
-                          (string= (org-ml-get-property :drawer-name e)
-                                   tsa-drawer-name)))))))
+(defun tsa--is-token-drawer (node)
+  "Return t if 'node' is a drawer with drawer name 'tsa-drawer-name'."
+  (and (org-ml-is-type 'drawer node)
+       (string= (org-ml-get-property :drawer-name node)
+                tsa-drawer-name)))
 
-(defun tsa--insert-token (text server)
-  "Insert RFC3161 token for contents of heading at point.
+(defun tsa--children-no-drawer (heading)
+  "Get the children of a heading with any RFC3136 token drawer removed."
+  (->> heading
+       org-ml-get-children
+       car
+       (org-ml-map-children
+         (-partial #'-remove #'tsa--is-token-drawer))))
+
+(defun tsa--insert-token-drawer (token-drawer heading)
+  (->> heading
+       (org-ml-match-map '(:first section)
+         (-partial #'org-ml-map-children
+                   (lambda (children)
+                     (let ((first-child (car children)))
+                       (if (org-ml-is-type 'property-drawer first-child)
+                           (cons first-child
+                                 (cons token-drawer (cdr children)))
+                         (cons token-drawer children))))))))
+
+(defun tsa--create-token (text server callback)
+  "Create an RFC3161 token for the specified text.
 
 TEXT is the text to generate the RFC3161 token for.
 SERVER is the URL of the time stamp authority to make the request to.
-
-Returns base64 encoded token."
-  (let ((body (tsa--request-body text)))
-    (request server
-     :type     "POST"
-     :encoding 'binary
-     :data     body
-     :headers  '(("Content-Type" . "application/timestamp-query"))
-     :parser   'buffer-string
-     :complete (cl-function
-                (lambda (&key data &allow-other-keys)
-                  (insert (base64-encode-string data))
-                  (next-line)
-                  (org-cycle)
-                  (let* ((element (org-element-at-point))
-                         (begin   (org-element-property :begin element))
-                         (end     (org-element-property :end   element)))
-                    (indent-region begin end)))))))
+CALLBACK is a function with signature '(&key data &allow-other-keys)' that is
+  passed the response from the time stamp authority."
+  (request server
+    :type     "POST"
+    :encoding 'binary
+    :data     (tsa--request-body text)
+    :headers  '(("Content-Type" . "application/timestamp-query"))
+    :parser   'buffer-string
+    :complete callback))
 
 (defun tsa--get-token ()
   "Get existing RFC3136 token for heading at point."
@@ -180,36 +191,41 @@ Returns base64 encoded token."
   (tsa--get-property (tsa--get-token)
                      "Time stamp: "))
 
-(defun tsa-timestamp-heading-2 ()
-  "Generate an RFC3136 token for heading at point.
+(defun tsa--token-drawer (token)
+  (->> token
+       base64-encode-string
+       org-ml-build-paragraph
+       (org-ml-build-drawer tsa-drawer-name)))
 
-The token is placed in a :RFC3136-TOKEN: drawer prior to the contents of the heading."
-  (interactive)
-  (org-back-to-heading-or-point-min)
-  (org-toggle-tag "timestamped" 'on)
-  (let* ((element (org-ml-parse-this-element))
-         (begin   (org-ml-get-property :contents-begin element))
-         (end     (org-ml-get-property :contents-end   element))
-         (section (tsa--section-no-drawer)))
-    (goto-char begin)
-    (org-insert-drawer nil tsa-drawer-name)
-    (tsa--insert-token (org-ml-to-trimmed-string section)
-                       tsa-url)))
+(defun tsa--toggle-timestamp-tag (heading)
+  (unless (org-ml-headline-has-tag tsa-tag-name heading)
+    (org-ml-insert-into-property :tags 0 tsa-tag-name heading)))
+
+(defun tsa--indent-subtree (subtree)
+  (let* ((begin (org-element-property :begin subtree))
+         (end   (org-element-property :end   subtree)))
+    (indent-region begin end)))
 
 (defun tsa-timestamp-heading ()
   "Generate an RFC3136 token for heading at point.
 
-The token is placed in a :RFC3136-TOKEN: drawer prior to the contents of the heading."
+The token is placed in a drawer prior to the contents of the heading.
+If there is already a token drawer, its contents are not included in the timestamp"
   (interactive)
-  (org-back-to-heading-or-point-min)
-  (org-toggle-tag "timestamped" 'on)
-  (let* ((element (org-element-at-point))
-         (begin   (org-element-property :contents-begin element))
-         (end     (org-element-property :contents-end   element))
-         (text    (buffer-substring-no-properties begin end)))
-    (goto-char begin)
-    (org-insert-drawer nil tsa-drawer-name)
-    (tsa--insert-token text tsa-url)))
+  (let ((heading-ast (org-ml-parse-this-subtree)))
+    (tsa--indent-subtree heading-ast)
+    (tsa--create-token (->> heading-ast
+                            tsa--children-no-drawer
+                            org-ml-to-trimmed-string)
+                       tsa-url
+                       (cl-function
+                        (lambda (&key data &allow-other-keys)
+                          (org-ml-update (-compose
+                                          #'tsa--toggle-timestamp-tag
+                                          (-partial #'tsa--insert-token-drawer
+                                                    (tsa--token-drawer data)))
+                                         heading-ast)
+                          (tsa--indent-subtree (org-ml-parse-this-subtree)))))))
 
 (defun tsa-show-timestamp ()
   "Display the time at which the heading at point was time stamped.
@@ -239,4 +255,5 @@ The verification status is displayed as a transient message."
 (defun tsa-debug ()
   (interactive)
   (with-output-to-temp-buffer "*timestamp properties*"
-    (print (tsa--section-no-drawer))))
+    (->> (org-ml-parse-this-subtree)
+         print)))
