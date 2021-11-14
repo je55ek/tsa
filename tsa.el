@@ -22,6 +22,8 @@
 (require 'org-ml)
 (require 'url)
 
+(setq tsa-no-token-message "No RFC3161 token present under heading")
+
 (defcustom tsa-drawer-name "RFC3161-TOKEN"
   "Name of the drawer that holds tokens for headings whose contents are timestamped."
   :type 'string
@@ -215,35 +217,18 @@ Returns the token returned by the time stamp authority."
 
 (defun tsa--get-token ()
   "Get existing RFC3136 token for heading at point."
-  (org-back-to-heading-or-point-min)
-  (org-narrow-to-subtree)
-  (let* ((ast    (org-element-parse-buffer))
-         (drawer (org-element-map
-                     ast
-                     'drawer
-                     (lambda (d)
-                       (when (string= tsa-drawer-name
-                                      (org-element-property :drawer-name d))
-                         d))
-                     nil  ;; INFO (nil is default)
-                     t))  ;; Stop at first match
-         (begin         (org-element-property :contents-begin drawer))
-         (end           (org-element-property :contents-end   drawer))
-         (encoded-token (buffer-substring-no-properties begin end))
-         (decoded-token (with-temp-buffer
-                          (org-mode)
-                          (insert encoded-token)
-                          (org-unindent-buffer)
-                          (base64-decode-region (point-min)
-                                                (point-max))
-                          (buffer-string))))
-    (widen)
-    decoded-token))
+  (if-let* ((drawer (->> (org-ml-parse-this-subtree)
+                      tsa--get-token-drawer))
+            (begin         (org-ml-get-property :contents-begin drawer))
+            (end           (org-ml-get-property :contents-end   drawer))
+            (encoded-token (buffer-substring-no-properties begin end)))
+    (base64-decode-string encoded-token)))
 
 (defun tsa-get-heading-timestamp()
   "Get the time at which the heading at point was time stamped."
-  (tsa--get-property (tsa--get-token)
-                     "Time stamp: "))
+  (when-let ((token (tsa--get-token)))
+    (tsa--get-property token
+                       "Time stamp: ")))
 
 (defun tsa--token-drawer (token)
   (->> token
@@ -286,52 +271,47 @@ timestamp"
 
 The time is displayed as a transient message."
   (interactive)
-  (message (tsa-get-heading-timestamp)))
+  (message (or (tsa-get-heading-timestamp)
+               tsa-no-token-message)))
 
 (defun tsa-show-timestamp-properties ()
   "Display the properties for the RFC3136 token attached to the heading at point.
 
 The properties are displayed in a temporary buffer."
   (interactive)
-  (with-output-to-temp-buffer "*timestamp properties*"
-    (print (tsa--get-properties (tsa--get-token)))))
+  (if-let ((token (tsa--get-token)))
+      (with-output-to-temp-buffer "*timestamp properties*"
+        (print (tsa--get-properties token)))
+    (message tsa-no-token-message)))
 
 (defun tsa-show-verification ()
   "Display the properties for the RFC3136 token attached to the heading at point.
 
 The verification status is displayed as a transient message."
   (interactive)
-  (momentary-string-display
-   (tsa--verify-token (tsa--get-token)
-                      (-> (org-ml-parse-this-subtree)
-                          tsa--contents-as-text)
-                      tsa-root-ca)
-   (point)))
+  (message
+   (if-let ((token (tsa--get-token)))
+       (tsa--verify-token token
+                          (-> (org-ml-parse-this-subtree)
+                              tsa--contents-as-text)
+                          tsa-root-ca)
+     tsa-no-token-message)))
 
 (defun tsa-show-token ()
   "Display the raw RFC3136 token attached to the heading at point.
 
 The token is displayed in a temporary buffer."
   (interactive)
-  (let ((token        (tsa--get-token))
-        (token-buffer (generate-new-buffer "*tsa token*")))
-    (with-current-buffer token-buffer
-      (set-buffer-multibyte nil)
-      (insert token))
-    (display-buffer token-buffer)))
-
-
-(defun tsa--get-token-two ()
-  "Get existing RFC3136 token for heading at point."
-  (let* ((drawer (->> (org-ml-parse-this-subtree)
-                      tsa--get-token-drawer))
-         (begin         (org-ml-get-property :contents-begin drawer))
-         (end           (org-ml-get-property :contents-end   drawer))
-         (encoded-token (buffer-substring-no-properties begin end)))
-    (base64-decode-string encoded-token)))
+  (if-let ((token (tsa--get-token)))
+      (let ((token-buffer (generate-new-buffer "*tsa token*")))
+        (with-current-buffer token-buffer
+          (set-buffer-multibyte nil)
+          (insert token))
+        (display-buffer token-buffer))
+    (message tsa-no-token-message)))
 
 (defun tsa-debug ()
   (interactive)
   (with-output-to-temp-buffer "*tsa debug*"
-    (->> (tsa--get-token-two)
+    (->> (tsa--get-token)
          print)))
