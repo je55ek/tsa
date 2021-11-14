@@ -11,6 +11,7 @@
 ;; TODO: Modify tsa--get-property to work with raw string rather than buffer
 ;; TODO: Use org-ml everywhere
 ;; TODO: Name "token" the right thing (might be overloaded right now, too)
+;; TODO: Scan for other todos in this file
 
 ;;; Code:
 
@@ -19,8 +20,7 @@
 (require 'org)
 (require 'org-element)
 (require 'org-ml)
-(require 'request)
-
+(require 'url)
 
 (defcustom tsa-drawer-name "RFC3161-TOKEN"
   "Name of the drawer that holds tokens for headings whose contents are timestamped."
@@ -32,32 +32,57 @@
   :type 'string
   :group 'tsa)
 
+(defcustom tsa-root-ca "/Users/jesse/Code/elisp/tsa/castore/freetsa-ca.pem"
+  "File path to root certificate for to use to verify tokens."
+  :type 'string
+  :group 'tsa)
+
 (defcustom tsa-tag-name "timestamped"
   "Tag added to headings whose contents are timestamped."
   :type 'string
   :group 'tsa)
 
-(defun tsa--request-body (text)
-  "Generate an RFC3161-compliant request body for timestamping specified text."
-  (with-temp-buffer
-    (insert text)
-    (call-process-region (point-min)
-                         (point-max)
-                         "openssl"
-                         t         ;; DELETE the text
-                         '(t       ;; Write stdout to temp buffer
-                           nil)    ;; Ignore stderr
-                         nil       ;; DISPLAY
-                         "ts"
-                         "-query"
-                         "-data"
-                         "/dev/stdin"
-                         "-no_nonce"
-                         "-cert"
-                         "-sha512")
-    (buffer-string)))
+(defun tsa--request-body (text-file)
+  "Generate an RFC3161-compliant request body for timestamping specified text file.
 
-(defun tsa--verify-token (token text ca-store)
+Returns the file path to the request body file."
+  (let ((req-file (make-temp-file "tsa.el.request")))
+    (call-process "openssl"
+                  nil ;; Do not pipe input to process
+                  nil ;; Do not save stdout in emacs
+                  nil ;; Do not display output in emacs
+                  "ts"
+                  "-query"
+                  "-data"
+                  text-file
+                  "-no_nonce"
+                  "-cert"
+                  "-sha512"
+                  "-out"
+                  req-file)
+    req-file))
+
+(defun tsa--curl-post (server req-file)
+  "POST contents of 'req-file' request to 'server' using external cURL process.
+
+Returns path to the response file."
+  (let ((resp-file  (make-temp-file "tsa.el.response"))
+        (stdout-buf (generate-new-buffer "*tsa curl stdout*")))
+    (call-process "curl"
+                  nil ;; Do not pipe input to process
+                  (list stdout-buf t)
+                  nil ;; Do not display output in emacs
+                  "-v"
+                  "-H"
+                  "Content-Type: application/timestamp-query"
+                  "--data-binary"
+                  (concat "@" req-file)
+                  "--output"
+                  resp-file
+                  server)
+    resp-file))
+
+(defun tsa--verify-token (token text ca-file)
   "Verify an RFC3136 token using a time stamp authority's public certificate.
 
 TOKEN is RFC3136 token to verify.
@@ -66,29 +91,32 @@ CA-STORE is URI of CA certificate store; may use 'file:' scheme.
 
 Returns t if token is verified; f, otherwise."
   (let ((token-file-name (make-temp-file "tsa.el.token"))
-        (coding-system-for-read  'no-conversion)
-        (coding-system-for-write 'no-conversion))
-    (message token-file-name)
+        ;; TODO remove
+        ;; (coding-system-for-read  'no-conversion)
+        ;; (coding-system-for-write 'no-conversion)
+        )
+    (message "tsa--verify-token: Writing token to " token-file-name)
     (with-temp-file token-file-name
-      (insert token)
-      (with-temp-buffer
-        (insert text)
-        (call-process-region (point-min)
-                             (point-max)
-                             "openssl"
-                             t         ;; DELETE the text
-                             '(t       ;; Write stdout to temp buffer
-                               nil)    ;; Ignore stderr
-                             nil       ;; DISPLAY
-                             "ts"
-                             "-verify"
-                             "-in"
-                             token-file-name
-                             "-data"
-                             "/dev/stdin"
-                             "-CAstore"
-                             ca-store)
-        (buffer-string)))))
+      (set-buffer-multibyte nil)
+      (insert token))
+    (with-temp-buffer
+      (insert text)
+      (call-process-region (point-min)
+                           (point-max)
+                           "openssl"
+                           t         ;; DELETE the text
+                           '(t       ;; Write stdout to temp buffer
+                             nil)    ;; Ignore stderr
+                           nil       ;; DISPLAY
+                           "ts"
+                           "-verify"
+                           "-in"
+                           token-file-name
+                           "-data"
+                           "/dev/stdin"
+                           "-CAfile"
+                           ca-file)
+      (buffer-string))))
 
 (defun tsa--get-properties (token)
   "Get the properties of an RFC3136 token."
@@ -125,39 +153,65 @@ PROPERTY is string prefix to use to extract output from 'openssl ts -reply'."
        (string= (org-ml-get-property :drawer-name node)
                 tsa-drawer-name)))
 
-(defun tsa--children-no-drawer (heading)
-  "Get the children of a heading with any RFC3136 token drawer removed."
+(defun tsa--contents-as-text (heading)
+  "Get all contents and children of heading with any RFC3136 token drawer removed."
   (->> heading
+       (org-ml-headline-map-section
+         (-partial #'-remove #'tsa--is-token-drawer))
        org-ml-get-children
-       car
-       (org-ml-map-children
-         (-partial #'-remove #'tsa--is-token-drawer))))
+       (-map #'org-ml-to-trimmed-string)
+       (-reduce #'concat)))
 
-(defun tsa--insert-token-drawer (token-drawer heading)
+(defun tsa--add-drawer-to-section (drawer heading)
+  "Add drawer as first child after any property drawer to existing section of subtree."
+  (org-ml-headline-map-section
+    (lambda (children)
+      (let ((first-child (car children)))
+        (if (org-ml-is-type 'property-drawer first-child)
+            (cons first-child
+                  (cons drawer (cdr children)))
+          (cons drawer children))))
+    heading))
+
+(defun tsa--add-drawer-to-heading (drawer heading)
+  "Add section to heading and add drawer to section."
+  (org-ml-map-children
+    (lambda (children)
+      (-> drawer
+          org-ml-build-section
+          (cons children)))
+    heading))
+
+(defun tsa--add-drawer (drawer heading)
+  "Insert drawer under heading after any property drawer and before any contents."
+  (if (org-ml-headline-get-section heading)
+      (tsa--add-drawer-to-section drawer heading)
+    (tsa--add-drawer-to-heading drawer heading)))
+
+(defun tsa--get-token-drawer (heading)
+  "Get the token drawer, if one exists, for heading."
   (->> heading
-       (org-ml-match-map '(:first section)
-         (-partial #'org-ml-map-children
-                   (lambda (children)
-                     (let ((first-child (car children)))
-                       (if (org-ml-is-type 'property-drawer first-child)
-                           (cons first-child
-                                 (cons token-drawer (cdr children)))
-                         (cons token-drawer children))))))))
+       org-ml-headline-get-section
+       (org-ml-match '(:first (:and drawer
+                                    (:drawer-name tsa-drawer-name))))
+       car))
 
-(defun tsa--create-token (text server callback)
+(defun tsa--create-token (server text-file)
   "Create an RFC3161 token for the specified text.
 
-TEXT is the text to generate the RFC3161 token for.
 SERVER is the URL of the time stamp authority to make the request to.
-CALLBACK is a function with signature '(&key data &allow-other-keys)' that is
-  passed the response from the time stamp authority."
-  (request server
-    :type     "POST"
-    :encoding 'binary
-    :data     (tsa--request-body text)
-    :headers  '(("Content-Type" . "application/timestamp-query"))
-    :parser   'buffer-string
-    :complete callback))
+TEXT is the text to generate the RFC3161 token for.
+
+Returns the token returned by the time stamp authority."
+  (let* ((req-file  (tsa--request-body     text-file))
+         (resp-file (tsa--curl-post server req-file )))
+    (message (concat "Request body written to "  req-file ))
+    (message (concat "Response body written to " resp-file))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert-file-contents-literally resp-file)
+      (buffer-substring-no-properties (point-min)
+                                      (point-max)))))
 
 (defun tsa--get-token ()
   "Get existing RFC3136 token for heading at point."
@@ -210,22 +264,22 @@ CALLBACK is a function with signature '(&key data &allow-other-keys)' that is
   "Generate an RFC3136 token for heading at point.
 
 The token is placed in a drawer prior to the contents of the heading.
-If there is already a token drawer, its contents are not included in the timestamp"
+If there is already a token drawer, its contents are not included in the
+timestamp"
   (interactive)
-  (let ((heading-ast (org-ml-parse-this-subtree)))
-    (tsa--indent-subtree heading-ast)
-    (tsa--create-token (->> heading-ast
-                            tsa--children-no-drawer
-                            org-ml-to-trimmed-string)
-                       tsa-url
-                       (cl-function
-                        (lambda (&key data &allow-other-keys)
-                          (org-ml-update (-compose
-                                          #'tsa--toggle-timestamp-tag
-                                          (-partial #'tsa--insert-token-drawer
-                                                    (tsa--token-drawer data)))
-                                         heading-ast)
-                          (tsa--indent-subtree (org-ml-parse-this-subtree)))))))
+  (tsa--indent-subtree (org-ml-parse-this-subtree))
+  (let ((heading   (org-ml-parse-this-subtree))
+        (text-file (make-temp-file "tsa.el.text")))
+    (with-temp-file text-file
+      (insert (tsa--contents-as-text heading)))
+    (message (concat "Text to timestamp written to " text-file))
+    (org-ml-update (-compose #'tsa--toggle-timestamp-tag
+                             (-partial #'tsa--add-drawer-to-section
+                                       (->> text-file
+                                            (tsa--create-token tsa-url)
+                                            tsa--token-drawer)))
+                   heading)
+    (tsa--indent-subtree (org-ml-parse-this-subtree))))
 
 (defun tsa-show-timestamp ()
   "Display the time at which the heading at point was time stamped.
@@ -247,13 +301,37 @@ The properties are displayed in a temporary buffer."
 
 The verification status is displayed as a transient message."
   (interactive)
-  (with-output-to-temp-buffer "*timestamp properties*"
-    (print (tsa--verify-token (tsa--get-token)
-                              (-> (tsa--section-no-drawer) (org-ml-to-trimmed-string))
-                              "file:///Users/jesse/Code/elisp/tsa/castore/"))))
+  (momentary-string-display
+   (tsa--verify-token (tsa--get-token)
+                      (-> (org-ml-parse-this-subtree)
+                          tsa--contents-as-text)
+                      tsa-root-ca)
+   (point)))
+
+(defun tsa-show-token ()
+  "Display the raw RFC3136 token attached to the heading at point.
+
+The token is displayed in a temporary buffer."
+  (interactive)
+  (let ((token        (tsa--get-token))
+        (token-buffer (generate-new-buffer "*tsa token*")))
+    (with-current-buffer token-buffer
+      (set-buffer-multibyte nil)
+      (insert token))
+    (display-buffer token-buffer)))
+
+
+(defun tsa--get-token-two ()
+  "Get existing RFC3136 token for heading at point."
+  (let* ((drawer (->> (org-ml-parse-this-subtree)
+                      tsa--get-token-drawer))
+         (begin         (org-ml-get-property :contents-begin drawer))
+         (end           (org-ml-get-property :contents-end   drawer))
+         (encoded-token (buffer-substring-no-properties begin end)))
+    (base64-decode-string encoded-token)))
 
 (defun tsa-debug ()
   (interactive)
-  (with-output-to-temp-buffer "*timestamp properties*"
-    (->> (org-ml-parse-this-subtree)
+  (with-output-to-temp-buffer "*tsa debug*"
+    (->> (tsa--get-token-two)
          print)))
