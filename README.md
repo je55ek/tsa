@@ -1,3 +1,3 @@
-# Trusted timestamps in Emacs for org mode documents
+# Trusted timestamps in Emacs for org documents
 
 Work in progress
